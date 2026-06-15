@@ -1,129 +1,164 @@
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
-#include <EEPROM.h> 
-#include <DHT.h> 
-#include <math.h> 
+#include <DHT.h>
+#include <RTClib.h>      
+#include <EEPROM.h>
+#include <Servo.h>
+#include <math.h>        
 
-DHT dht(7, DHT11); LiquidCrystal_I2C lcd(0x27, 16, 2); 
-float f, t = 0, rx = 0, ry = 0, ip = 0, dc = 0.0, rg = 0.0; 
-const float F_MIN = 87.5, F_MAX = 108.0;
-int h = 9, m = 15, s = 0, u = 0, md = 0, ci = 0, gm = 0, id = 0, last_op = 0;
-unsigned long tc = 0, td = 0, tg = 0, ta = 0, bu = 0, bd = 0, b3 = 0; 
-int th[] = {0, 0, 0, 0}, bx = 7, by = 0, dx = 1, dy = 1, pl = 0, pr = 1;
-bool pm = false, clr_x = false; byte st[] = {0, 0, 0, 0, 0};
-const char* ops[] = {".", "+", "-", "*", "/", "=", "B^", "PRG", "AVT", "G:LUN", "X>P", "LN", "EXP", "SIN", "COS", "TAN", "SH", "CH", "TH"};
-byte bc = { {0,0,0,0,0,0,0,0}, {0,0,0,0,0,0,0,31}, {0,0,0,0,0,0,31,31}, {0,0,0,0,0,31,31,31}, {0,0,0,31,31,31,31,31}, {0,0,31,31,31,31,31,31}, {0,31,31,31,31,31,31,31}, {31,31,31,31,31,31,31,31} };
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+DHT dht(7, DHT11);
+RTC_DS3231 rtc;
+Servo valveServo;
 
-void setRTC(byte hr, byte min) {
-  Wire.beginTransmission(0x68); Wire.write(0); Wire.write(0);
-  Wire.write(((min/10)<<4)|(min%10)); Wire.write(((hr/10)<<4)|(hr%10)); Wire.endTransmission();
+const int BTN1=2, BTN2=3, BTN3=8, RGB_R=4, RGB_G=5, RGB_B=6, LED_SIGNAL=9, SERVO_PIN=10; 
+enum SystemModes { HOME, FM, METEO, CALC, PONG, CALENDAR };
+SystemModes mode = HOME;
+
+int slot=0, step=0, ballX=7, ballY=1, ballDX=1, ballDY=-1, padL=0, padR=0, historyIdx=0, cmdIdx=0, lastOp=0, realRSSI=0;
+float regX=0.0, regY=0.0, freq=101.2;
+bool isEnterNum = true, isProg = false; 
+unsigned long lastAct = 0;
+float tempHistory[] = {22, 22, 23, 22, 23, 24, 23, 24};
+
+const char* cmds[] = {
+  "0","1","2","3","4","5","6","7","8","9",".","[CX]",
+  "[+]","[-]","[*]","[/]","[=]","[SH]","[CH]","[TSI]",
+  "[PRG]","[RUN]","[BAL]","[DER]","[INT]"
+};
+#define TOTAL_CMDS 25
+const char* days[] = {"SUNDAY", "MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "FRIDAY", "SATURDAY"};
+
+byte b1[]={0,0,0,0,0,0,0,31}, b2[]={0,0,0,0,0,31,31,31}, b3[]={0,0,0,31,31,31,31,31}, b4[]={31,31,31,31,31,31,31,31};
+
+void setFreq(float f) {
+  unsigned int fb = (4 * (f * 1000000 + 225000)) / 32768;
+  Wire.beginTransmission(0x60); Wire.write(fb >> 8); Wire.write(fb & 0xFF); Wire.write(0xB0); Wire.write(0x10); Wire.write(0x00); Wire.endTransmission();
+  delay(20); Wire.requestFrom(0x60, 5);
+  if (Wire.available() >= 4) { Wire.read(); Wire.read(); Wire.read(); realRSSI = map(((Wire.read() >> 4) & 0x0F), 0, 15, 0, 100); }
 }
-void readRTC() {
-  Wire.beginTransmission(0x68); Wire.write(0); Wire.endTransmission(); Wire.requestFrom(0x68, 3);
-  if (Wire.available()) { s = Wire.read(); s = (s>>4)*10+(s&0x0F); m = Wire.read(); m = (m>>4)*10+(m&0x0F); h = Wire.read(); h = (h>>4)*10+(h&0x0F); }
-}
-void rgb(int r, int g, int b) { analogWrite(4, 255-r); analogWrite(5, 255-g); analogWrite(6, 255-b); }
-void snd(byte b3_v, byte b4_v) {
-  unsigned int fb = 4 * (f * 1000000 + 225000) / 32768;
-  Wire.beginTransmission(0x60); Wire.write(fb>>8); Wire.write(fb&0xFF); Wire.write(b3_v); Wire.write(b4_v); Wire.write(0x00); Wire.endTransmission();
-}
-int getS() { 
-  Wire.requestFrom(0x60, 5); for (int i = 0; i < 3; i++) if (Wire.available()) Wire.read();
-  return Wire.available() ? (Wire.read()>>4)&0x0F : 0; 
-}
-void chk() { int sig = getS(); rgb(sig<=4?255:0, (sig>4&&sig<10)?180:(sig>=10?255:0), 0); }
-void autoScan() {
-  lcd.clear(); lcd.print("SCANNING..."); float bf = f; int ms = 0;
-  for (float cf = F_MIN; cf <= F_MAX; cf += 0.2) { f = cf; snd(0xB0,0x10); delay(60); int sl = getS(); if (sl > ms) { ms = sl; bf = cf; } }
-  f = bf; snd(0xB0,0x10); chk(); EEPROM.put(10, f);
-}
-void addH(int v, int *arr) { for (int i = 0; i < 3; i++) arr[i] = arr[i+1]; arr = v; }
-int getB(int v, int mn, int mx) { int b = map(v, mn, mx, 1, 7); return b<1?1:(b>7?7:b); }
-void runPrg() { for (int i = 0; i < 5; i++) { if(st[i] != 0) { calc(st[i]); delay(15); } } }
-void doEqual() {
-  if(last_op == 11) rx = ry + rx; else if(last_op == 12) rx = ry - rx; else if(last_op == 13) rx = ry * rx; else if(last_op == 14 && rx != 0) rx = ry / rx;
-  ip = rx; clr_x = true; last_op = 0;
-}
-void rwEep(bool wr) { for (int i = 0; i < 5; i++) { if(wr) EEPROM.write(50+i, st[i]); else st[i] = EEPROM.read(50+i); } }
-void calc(int op) {
-  if (pm && op != 20) { if (id < 5) st[id++] = op; return; }
-  if (op <= 9) { 
-    if (clr_x) { ip = 0; dc = 0.0; clr_x = false; }
-    if (dc > 0.0) { ip = ip + op * dc; dc *= 0.1; } else { ip = ip * 10 + op; } rx = ip; 
-  }
-  else if (op == 10) dc = 0.1; 
-  else if (op == 16) { ry = rx; ip = 0; dc = 0.0; clr_x = true; } 
-  else if (op == 11 || op == 12 || op == 13 || op == 14) { ry = rx; last_op = op; ip = 0; dc = 0.0; clr_x = true; }
-  else if (op == 17) { pm = true; id = 0; for (int i = 0; i < 5; i++) st[i] = 0; } 
-  else if (op == 18) { rwEep(false); runPrg(); } 
-  else if (op == 19) { gm = 1; pm = false; ip = 0; dc = 0.0; rg = 1000.0; rx = 50.0; ry = 0; }
-  else if (op == 20) { rwEep(true); pm = false; } 
-  else if (op == 21) { if(rx > 0) rx = log(rx); ip = rx; } else if (op == 22) { rx = exp(rx); ip = rx; }
-  else if (op == 23) rx = sin(rx * 3.1415 / 180.0); else if (op == 24) rx = cos(rx * 3.1415 / 180.0); 
-  else if (op == 25) { if(cos(rx) != 0) rx = tan(rx * 3.1415 / 180.0); }
-  else if (op == 26) rx = sinh(rx); else if (op == 27) rx = cosh(rx); else if (op == 28) rx = tanh(rx);
-  else if (op == 15) doEqual();
-}
-void ui() {
-  lcd.clear();
-  if (md == 0) {
-    if(h < 10) lcd.print("0"); lcd.print(h); lcd.print(s % 2 == 0 ? ":" : " "); if(m < 10) lcd.print("0"); lcd.print(m);
-    lcd.setCursor(8, 0); lcd.print("HUM: "); lcd.print(u); lcd.print("%"); lcd.setCursor(0, 1); lcd.print("Radio: "); lcd.print(f, 1); lcd.print("MHz");
-  } else if (md == 1) { 
-    lcd.print("MODE: FM RADIO"); lcd.setCursor(0, 1); lcd.print("F: "); lcd.print(f, 1); lcd.print("MHz S:"); lcd.print(getS()); 
-  } else if (md == 2) { 
-    lcd.print("T:"); lcd.print((int)t); lcd.print("C ["); for(int i = 0; i < 4; i++) lcd.write(getB(th[i], 10, 40)); 
-    lcd.print("]"); lcd.setCursor(0, 1); lcd.print("HUMIDITY: "); lcd.print(u); lcd.print("%");
-  } else if (md == 3) {
-    if(gm == 0) { if(pm) { lcd.print("MK52 [PRG] Sh:"); lcd.print(id); } else { lcd.print("MK-52 CALC"); } } else lcd.print("G:LUNALET");
-    lcd.setCursor(0, 1); lcd.print("[");
-    if (ci <= 9) lcd.print(ci); 
-    else if (ci >= 10 && ci <= 28) lcd.print(ops[ci - 10]); lcd.print("]");
-    if(gm == 1) { lcd.setCursor(6, 1); lcd.print("V:"); lcd.print((int)rx); lcd.setCursor(11, 1); lcd.print("H:"); lcd.print((int)rg); } else { lcd.setCursor(8, 1); lcd.print("X:"); lcd.print(rx, 2); }
+
+void setRGB(int r, int g, int b) { analogWrite(RGB_R, r); analogWrite(RGB_G, g); analogWrite(RGB_B, b); }
+void pD(int v) { if(v<10) lcd.print("0"); lcd.print(v); }
+
+void renderUI() {
+  lcd.setCursor(0, 0); DateTime now = rtc.now();
+  if (mode == HOME) {
+    lcd.print("TIME: "); pD(now.hour()); lcd.print(":"); pD(now.minute()); lcd.print("   FM ");
+    lcd.setCursor(0, 1); lcd.print(freq, 1); lcd.print("MHz   HUM: "); lcd.print(dht.readHumidity(), 0); lcd.print("%");
+  } else if (mode == FM) {
+    lcd.print("FM RECEIVER     "); lcd.setCursor(0, 1); lcd.print(freq, 1); lcd.print("MHz RSSI:"); lcd.print(realRSSI); lcd.print("%   ");
+  } else if (mode == METEO) {
+    lcd.print("WEATHER LAB MON "); lcd.setCursor(0, 1); lcd.print("T:"); lcd.print(dht.readTemperature(),0); lcd.print("C H:"); lcd.print(dht.readHumidity(),0); lcd.print("% ");
+    lcd.setCursor(11, 1); 
+    for (int i = 0; i < 5; i++) { int idx = (historyIdx + i) % 8; lcd.write(tempHistory[idx] < 22.2 ? 1 : (tempHistory[idx] < 22.8 ? 2 : (tempHistory[idx] < 23.5 ? 3 : 4))); }
+  } else if (mode == CALC) {
+    lcd.print(isProg ? "MK52 PRG  ST:" : "MK52 CALC ST:"); pD(step); lcd.print("  "); 
+    lcd.setCursor(0, 1); lcd.print(cmds[cmdIdx]); lcd.print("        "); lcd.setCursor(7, 1); lcd.print("X:"); 
+    if (regX >= 10.0 || regX <= -10.0) { lcd.print((long)regX); lcd.print("    "); } else { lcd.print(regX, 1); lcd.print("    "); }
+  } else if (mode == CALENDAR) {
+    lcd.print("DATE: "); pD(now.day()); lcd.print("/"); pD(now.month()); lcd.print("/"); lcd.print(now.year());
+    lcd.setCursor(0, 1); lcd.print("DAY: "); lcd.print(days[now.dayOfTheWeek()]); lcd.print("        ");
   }
 }
-void setup() {
-  Wire.begin(); dht.begin(); randomSeed(analogRead(0));
-  pinMode(2, INPUT_PULLUP); pinMode(3, INPUT_PULLUP); pinMode(8, INPUT_PULLUP); for(int i = 4; i <= 6; i++) pinMode(i, OUTPUT);
-  lcd.init(); lcd.backlight(); for(int i = 0; i < 8; i++) lcd.createChar(i, bc[i]);
-  lcd.clear(); lcd.setCursor(2, 0); lcd.print("HELLO WORLD!"); lcd.setCursor(3, 1); lcd.print("DIY SYSTEM");
-  rgb(0, 0, 255); delay(10000); rgb(255, 255, 255); snd(0x00, 0x80);
-  EEPROM.get(10, f); if(f < F_MIN || f > F_MAX || isnan(f)) { f = 101.2; EEPROM.put(10, f); } readRTC(); tc = millis(); ta = millis(); ui();
+
+void setSystemMode(SystemModes m) {
+  mode = m; lcd.clear(); digitalWrite(LED_SIGNAL, LOW); 
+  if (mode == HOME) setRGB(0, 255, 0);
+  else if (mode == FM) setRGB(255, 255, 255);
+  else if (mode == METEO) setRGB(0, 255, 255);
+  else if (mode == CALC) setRGB(128, 0, 128);
+  else if (mode == PONG) setRGB(255, 0, 0);
+  else if (mode == CALENDAR) setRGB(255, 165, 0);
+  renderUI();
 }
-void loop() {
-  if (millis() - tc >= 1000) {
-    tc += 1000; readRTC();
-    if(s == 0) { if(m % 15 == 0) addH((int)t, th); if(h == 7 && m == 0) { md = 1; snd(0xB0, 0x10); chk(); } if(gm == 1) { rg -= rx; rx += 1; } }
-    if(md == 0 && (millis() - ta >= 120000)) { md = 4; bx = 7; by = 0; dx = 1; dy = 1; rgb(0, 0, 255); } if(md != 3 && md != 4) ui();
+
+int getBtn(int p) {
+  if (digitalRead(p) == LOW) { unsigned long s = millis(); while (digitalRead(p) == LOW); return (millis() - s > 600) ? 2 : 1; }
+  return 0;
+}
+
+void calcOp(byte opCode) {
+  if (opCode >= 12 && opCode <= 15) { regY = regX; regX = 0; lastOp = opCode; }
+  else if (opCode == 16) { if (lastOp == 12) regX = regY + regX; else if (lastOp == 13) regX = regY - regX; else if (lastOp == 14) regX = regY * regX; else if (lastOp == 15 && regX != 0) regX = regY / regX; }
+  else if (opCode == 17) regX = sinh(regX); else if (opCode == 18) regX = cosh(regX);
+  else if (opCode == 19) { if (lastOp == 14 && regY > 0) { regX = regX * log(regY); valveServo.write(constrain(map((int)regX, 0, 9000, 0, 180), 0, 180)); } } 
+  else if (opCode == 22) { if(regY > 0) { float rad = regX * M_PI / 180.0; float v = regY; regX = (v * v * sin(2.0 * rad)) / 9.81; regY = (v * v * sin(rad) * sin(rad)) / (2.0 * 9.81); valveServo.write(constrain((int)regX, 0, 180)); } }
+  else if (opCode == 23) regX = 2.0 * regX; else if (opCode == 24) regX = (regX * regX * regX) / 3.0;
+}
+
+void runStoredProgram() {
+  isProg = false; isEnterNum = false; regX = 0; regY = 0;
+  for (int i = 0; i < 30; i++) {
+    byte c = EEPROM.read((slot * 30) + i); if (c == 255 || c == 20) break; 
+    if (c >= 0 && c <= 10) { if (c <= 9) { regX = isEnterNum ? regX * 10 + c : c; isEnterNum = true; } else if (c == 10) isEnterNum = true; } 
+    else { isEnterNum = false; calcOp(c); }
+    delay(50); 
   }
-  if (md != 4 && millis() - td >= 5000) { td = millis(); t = dht.readTemperature(); u = dht.readHumidity(); if(!isnan(t) && th == 0) for(int i = 0; i < 4; i++) th[i] = (int)t; if(md != 3) ui(); }
-  if (digitalRead(2) == LOW || digitalRead(3) == LOW || digitalRead(8) == LOW) if(md == 0) ta = millis();
-  if (md == 0) {
-    if(digitalRead(2) == LOW) { md = 1; snd(0xB0, 0x10); chk(); ui(); delay(300); }
-    if(digitalRead(3) == LOW) { md = 3; gm = 0; rx = ry = ip = ci = 0; dc = 0.0; clr_x = false; last_op = 0; rgb(255, 0, 255); ui(); delay(300); }
-    if(digitalRead(8) == LOW) { md = 2; snd(0x00, 0x80); rgb(0, 255, 255); ui(); delay(300); }
+}
+
+void executeMK52Logic() {
+  if (isProg && cmdIdx == 11) { if (step > 0) { step--; EEPROM.update((slot * 30) + step, 255); regX = 0; } return; }
+  if (isProg && cmdIdx != 20) { EEPROM.update((slot * 30) + step, (uint8_t)cmdIdx); step++; if (step >= 30) { step = 0; isProg = false; } return; }
+  if (cmdIdx >= 0 && cmdIdx <= 9) { regX = isEnterNum ? regX * 10 + cmdIdx : cmdIdx; isEnterNum = true; return; }
+  if (cmdIdx == 10) { isEnterNum = true; return; } isEnterNum = false; 
+  if (cmdIdx == 11) { regX = 0; }
+  else if (cmdIdx == 20) { isProg = !isProg; if (isProg) { for(int i=0; i<30; i++) EEPROM.update((slot * 30) + i, 255); step = 0; } }
+  else if (cmdIdx == 21) runStoredProgram();
+  else calcOp(cmdIdx);
+}
+
+void handleButtonsLogic() {
+  int b1 = getBtn(BTN1), b2 = getBtn(BTN2), b3 = getBtn(BTN3); if (b1 > 0 || b2 > 0 || b3 > 0) lastAct = millis(); 
+  if (mode == PONG) { if (b3 == 1) { setSystemMode(HOME); return; } if (b1 == 1) padL = !padL; if (b2 == 1) padR = !padR; return; }
+  if (mode == HOME) { if (b1 == 1) setSystemMode(FM); if (b1 == 2) setSystemMode(CALENDAR); if (b2 == 1) setSystemMode(METEO); if (b2 == 2) setSystemMode(CALC); } 
+  else if (mode == FM) {
+    if (b1 == 1) { freq += 0.1; setFreq(freq); EEPROM.put(500, freq); renderUI(); } 
+    if (b2 == 1) { freq -= 0.1; setFreq(freq); EEPROM.put(500, freq); renderUI(); } 
+    if (b2 == 2) { lcd.clear(); lcd.print("SCANNING..."); freq = 102.7; setFreq(freq); delay(1200); setSystemMode(FM); } if (b3 == 1) setSystemMode(HOME); 
+  } else if (mode == METEO || mode == CALENDAR) { if (b3 == 1) setSystemMode(HOME); } 
+  else if (mode == CALC) {
+    if (b1 == 1) { cmdIdx = (cmdIdx + 1) % TOTAL_CMDS; renderUI(); } 
+    if (b2 == 1) { cmdIdx--; if (cmdIdx < 0) cmdIdx = TOTAL_CMDS - 1; renderUI(); } 
+    if (b2 == 2) { executeMK52Logic(); renderUI(); } 
+    if (b3 == 1) { if (regX >= 0) regX = sqrt(regX); renderUI(); } if (b3 == 2) { isProg = false; setSystemMode(HOME); } 
   }
-  else if (md == 1) {
-    if(digitalRead(2) == LOW && digitalRead(3) == LOW) { autoScan(); ui(); delay(500); return; }
-    if(digitalRead(8) == LOW) { if(b3 == 0) b3 = millis(); if(millis() - b3 > 1500) { md = 0; snd(0x00, 0x80); rgb(255, 255, 255); ui(); b3 = 0; delay(500); } }
-    if(digitalRead(2) == LOW) { f += 0.1; if(f > F_MAX) f = F_MIN; snd(0xB0, 0x10); chk(); ui(); delay(200); }
-    if(digitalRead(3) == LOW) { f -= 0.1; if(f < F_MIN) f = F_MAX; snd(0xB0, 0x10); chk(); ui(); delay(200); }
-  }
-  else if (md == 2) { if(digitalRead(8) == LOW) { if(b3 == 0) b3 = millis(); if(millis() - b3 > 1500) { md = 0; rgb(255, 255, 255); ui(); b3 = 0; delay(500); } } else b3 = 0; }
-  else if (md == 3) {
-    if(digitalRead(2) == LOW) { if(bu == 0) bu = millis(); if(millis() - bu > 1500) { pm = false; id = 0; rgb(255, 0, 255); ui(); bu = 0; delay(500); return; } } 
-    else { if(bu > 0) { if(millis() - bu < 1500) { ci = (ci + 1) % 29; ui(); } bu = 0; delay(150); } }
-    if(digitalRead(3) == LOW) { if(bd == 0) bd = millis(); if(millis() - bd >= 1500 && millis() - bd < 4000) { ci = (ci == 0) ? 28 : ci - 1; ui(); delay(250); bd = millis(); } }
-    else { if(bd > 0) { if(millis() - bd < 1500) { calc(ci); ui(); } bd = 0; delay(150); } }
-    if(digitalRead(8) == LOW) { if(b3 == 0) b3 = millis(); if(millis() - b3 > 1500) { md = 0; rgb(255, 255, 255); ui(); b3 = 0; delay(500); return; } } 
-    else { if(b3 > 0) { if(millis() - b3 < 1500) { rx = (rx >= 0) ? sqrt(rx) : rx; ip = rx; ui(); } else { rx = pow(ry, rx); ip = rx; ui(); } b3 = 0; delay(150); } }
-  }
-  else if (md == 4) {
-    if (millis() - tg >= 250) { 
-      tg = millis(); bx += dx; by += dy; if(by < 0){by = 0; dy = -dy;} if(by > 1){by = 1; dy = -dy;} if(bx == 1 && by == pl){dx = -dx; rgb(0, 255, 0);} if(bx == 14 && by == pr){dx = -dx; rgb(0, 255, 0);}
-      if(bx < 0 || bx > 15){bx = 7; by = 0; dx = -dx; rgb(255, 0, 0); delay(300);} lcd.clear(); lcd.setCursor(1, pl); lcd.print("|"); lcd.setCursor(14, pr); lcd.print("|"); lcd.setCursor(bx, by); lcd.print("o"); 
+}
+
+void handleBackgroundTick() {
+  static unsigned long lastTick = 0; if (millis() - lastTick < 1000) return; lastTick = millis();
+  if (mode == FM) { analogWrite(LED_SIGNAL, map(realRSSI, 0, 100, 0, 255)); setFreq(freq); } 
+  DateTime now = rtc.now(); if (now.hour() == 7 && now.minute() == 0 && now.second() == 0) setSystemMode(FM);
+  static int gTimer = 0; if (++gTimer >= 3600) { gTimer = 0; tempHistory[historyIdx] = dht.readTemperature(); if (isnan(tempHistory[historyIdx])) tempHistory[historyIdx] = 23.0; historyIdx = (historyIdx + 1) % 8; }
+  
+  if (mode == CALC && !isProg) {
+    Wire.beginTransmission(0x68); Wire.write(0x3B); Wire.endTransmission(false); Wire.requestFrom(0x68, 6, true);
+    if(Wire.available() >= 6) {
+      int16_t acX = Wire.read() << 8 | Wire.read(); Wire.read(); Wire.read(); Wire.read(); Wire.read();
+      valveServo.write(constrain(90 - map(acX, -16384, 16384, -90, 90), 0, 180));
     }
-    if(digitalRead(8) == LOW) { if(b3 == 0) b3 = millis(); if(millis() - b3 > 1500) { md = 0; ta = millis(); rgb(255, 255, 255); ui(); b3 = 0; delay(500); } }
-    if(digitalRead(2) == LOW) { pl = (pl + 1) % 2; delay(150); } if(digitalRead(3) == LOW) { pr = (pr + 1) % 2; delay(150); }
+  }
+
+  if (millis() - lastAct > 20000 && mode == HOME) setSystemMode(PONG);
+  if (mode != PONG) renderUI();
+  else {
+    ballX += ballDX; ballY += ballDY; if (ballY <= 0 || ballY >= 1) ballDY = -ballDY;
+    if (ballX <= 1 && ballY == padL) { ballDX = 1; ballX = 1; } if (ballX >= 14 && ballY == padR) { ballDX = -1; ballX = 14; }
+    if (ballX < 0 || ballX > 15) { digitalWrite(LED_SIGNAL, HIGH); delay(150); digitalWrite(LED_SIGNAL, LOW); ballX = 7; ballY = 1; } 
+    lcd.clear(); lcd.setCursor(0, padL); lcd.print("|"); lcd.setCursor(15, padR); lcd.print("#"); lcd.setCursor(ballX, ballY); lcd.print("o");
   }
 }
+
+void setup() {
+  Wire.begin(); lcd.init(); lcd.backlight(); dht.begin(); rtc.begin(); valveServo.attach(SERVO_PIN); valveServo.write(90);
+  Wire.beginTransmission(0x68); Wire.write(0x6B); Wire.write(0); Wire.endTransmission(true);
+  pinMode(BTN1, INPUT_PULLUP); pinMode(BTN2, INPUT_PULLUP); pinMode(BTN3, INPUT_PULLUP);
+  pinMode(RGB_R, OUTPUT); pinMode(RGB_G, OUTPUT); pinMode(RGB_B, OUTPUT); pinMode(LED_SIGNAL, OUTPUT);
+  lcd.createChar(1, b1); lcd.createChar(2, b2); lcd.createChar(3, b3); lcd.createChar(4, b4);
+  setRGB(128, 0, 128); lcd.setCursor(2, 0); lcd.print("HELLO WORLD!"); lcd.setCursor(3, 1); lcd.print("DIY SYSTEM"); delay(2000); lcd.clear();
+  if (rtc.lostPower()) { rtc.adjust(DateTime(F(__DATE__), F(__TIME__))); }
+  float sf; EEPROM.get(500, sf); if (sf >= 87.5 && sf <= 108.0) freq = sf; setFreq(freq); lastAct = millis(); setSystemMode(HOME);
+}
+
+void loop() { handleButtonsLogic(); handleBackgroundTick(); }
+
